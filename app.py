@@ -2,11 +2,15 @@ import time
 import threading
 import sqlite3
 import secrets
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 import serial
 from flask import Flask, jsonify, render_template, render_template_string, request
+
+import vision
+from vision import normalize_bib
 
 PORT = '/dev/ttyUSB0'
 BAUDRATE = 115200
@@ -14,25 +18,43 @@ COMMAND = bytes.fromhex('AA 00 22 00 00 22 DD')
 MIN_LAP_SECONDS = 10.0  # Durée minimale entre deux tours après le premier
 ABSENCE_SECONDS = 2.0   # Absence nécessaire avant un nouveau passage
 POLL_SECONDS = 0.10  # Interrogation toutes les 100 ms (au lieu de 250 ms)
+MERGE_SECONDS = 5.0  # RFID et caméra à moins de 5 s d'écart = même passage
 DB_PATH = Path(__file__).with_name('competition.db')
 
 app = Flask(__name__)
 lock = threading.RLock()
+# last_seen et armed sont indexés par (source, epc) : chaque système (RFID,
+# caméra) a sa propre détection d'absence. last_lap et laps sont communs :
+# un passage vu par les deux systèmes ne compte qu'une fois.
 state = {'running': False, 'started_wall': None, 'started_mono': None,
          'stopped_elapsed': 0.0, 'last_seen': {}, 'armed': {}, 'last_lap': {},
          'laps': {}, 'reader': 'Initialisation', 'unknown': {},
-         'scan': None, 'known_epcs': set()}
+         'scan': None, 'known_epcs': set(),
+         'bib_to_epc': {}, 'last_passage': {}, 'camera': 'Initialisation',
+         'camera_recent': deque(maxlen=10)}
+
+_schema_ready = False
 
 
 def connect_db():
+    global _schema_ready
     db = sqlite3.connect(DB_PATH)
+    if _schema_ready:
+        return db
     db.execute('PRAGMA journal_mode=WAL')
     db.execute('CREATE TABLE IF NOT EXISTS participants (epc TEXT PRIMARY KEY, name TEXT NOT NULL)')
     db.execute('''CREATE TABLE IF NOT EXISTS passages (
         id INTEGER PRIMARY KEY AUTOINCREMENT, epc TEXT NOT NULL,
         lap INTEGER NOT NULL, lap_seconds REAL NOT NULL,
         elapsed_seconds REAL NOT NULL, timestamp TEXT NOT NULL)''')
+    # Ajouts pour la caméra (sans casser une base existante).
+    if 'bib' not in {r[1] for r in db.execute('PRAGMA table_info(participants)')}:
+        db.execute('ALTER TABLE participants ADD COLUMN bib TEXT')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_bib ON participants(bib)')
+    if 'source' not in {r[1] for r in db.execute('PRAGMA table_info(passages)')}:
+        db.execute("ALTER TABLE passages ADD COLUMN source TEXT NOT NULL DEFAULT 'rfid'")
     db.commit()
+    _schema_ready = True
     return db
 
 
@@ -94,38 +116,84 @@ def process_epc(epc, now):
             state['unknown'][epc] = datetime.now().isoformat(timespec='seconds')
             return
 
-        previous_seen = state['last_seen'].get(epc)
+        record_detection(epc, 'rfid', now)
+
+
+def process_bib(bib, now):
+    """Appelé par vision.py pour chaque dossard lu par la caméra."""
+    with lock:
+        epc = state['bib_to_epc'].get(bib)
+        state['camera_recent'].append({
+            'bib': bib, 'known': epc is not None,
+            'time': datetime.now().isoformat(timespec='seconds')})
+        if epc is None or not state['running']:
+            return
+        record_detection(epc, 'camera', now)
+
+
+def set_camera_status(text):
+    with lock:
+        state['camera'] = text
+
+
+def record_detection(epc, source, now):
+    """Compte un tour pour un participant, que la détection vienne du RFID
+    ('rfid') ou de la caméra ('camera'). Les mêmes règles s'appliquent aux
+    deux, et un passage vu par les deux systèmes n'est compté qu'une fois."""
+    with lock:
+        if not state['running'] or now < state['started_mono']:
+            return
+        key = (source, epc)
+        previous_seen = state['last_seen'].get(key)
         if previous_seen is not None and now - previous_seen >= ABSENCE_SECONDS:
-            state['armed'][epc] = True
-        state['last_seen'][epc] = now
-        if not state['armed'].get(epc, True):
+            state['armed'][key] = True
+        state['last_seen'][key] = now
+        if not state['armed'].get(key, True):
             return
 
-        if epc not in state['last_lap']:
+        last_lap = state['last_lap'].get(epc)
+        if last_lap is None:
             # Premier passage accepté immédiatement.
             lap_seconds = now - state['started_mono']
         else:
-            # Délai minimum uniquement pour CE badge, pas les autres.
-            lap_seconds = now - state['last_lap'][epc]
+            # Délai minimum uniquement pour CE participant, pas les autres.
+            lap_seconds = now - last_lap
             if lap_seconds < MIN_LAP_SECONDS:
+                mark_seen_by_both(epc, source, now)
                 return
 
         elapsed = now - state['started_mono']
         lap = state['laps'].get(epc, 0) + 1
         db = connect_db()
         try:
-            db.execute(
-                'INSERT INTO passages (epc, lap, lap_seconds, elapsed_seconds, timestamp) VALUES (?,?,?,?,?)',
+            cur = db.execute(
+                'INSERT INTO passages (epc, lap, lap_seconds, elapsed_seconds, timestamp, source) VALUES (?,?,?,?,?,?)',
                 (epc, lap, lap_seconds, elapsed,
-                 datetime.now().isoformat(timespec='seconds'))
+                 datetime.now().isoformat(timespec='seconds'), source)
             )
             db.commit()
         finally:
             db.close()
         state['laps'][epc] = lap
         state['last_lap'][epc] = now
-        state['armed'][epc] = False
-        print(f'TOUR {lap}: {epc} - {lap_seconds:.2f} s', flush=True)
+        state['last_passage'][epc] = {'id': cur.lastrowid, 'source': source}
+        state['armed'][key] = False
+        print(f'TOUR {lap}: {epc} ({source}) - {lap_seconds:.2f} s', flush=True)
+
+
+def mark_seen_by_both(epc, source, now):
+    """Le passage déjà compté par un système est confirmé par l'autre."""
+    passage = state['last_passage'].get(epc)
+    if (passage is None or passage['source'] in (source, 'both')
+            or abs(now - state['last_lap'][epc]) > MERGE_SECONDS):
+        return
+    db = connect_db()
+    try:
+        db.execute("UPDATE passages SET source='both' WHERE id=?", (passage['id'],))
+        db.commit()
+    finally:
+        db.close()
+    passage['source'] = 'both'
 
 
 def update_badge_absence():
@@ -133,9 +201,9 @@ def update_badge_absence():
     with lock:
         if not state['running']:
             return
-        for epc, last_seen in list(state['last_seen'].items()):
+        for key, last_seen in list(state['last_seen'].items()):
             if now - last_seen >= ABSENCE_SECONDS:
-                state['armed'][epc] = True
+                state['armed'][key] = True
 
 
 def reader_worker():
@@ -185,7 +253,8 @@ button:disabled{opacity:.46;cursor:not-allowed}
 button.delete{background:#b42318}
 button + button{margin-left:9px}
 input[type=text]{padding:11px;border:1px solid #cbd5e1;border-radius:8px;max-width:100%;width:380px;font:inherit}
-label[for=name]{display:block;margin:16px 0 7px;font-weight:600}
+label[for=name],label[for=bib]{display:block;margin:16px 0 7px;font-weight:600}
+.bib-cell{font-weight:650;font-variant-numeric:tabular-nums}
 #message{white-space:pre-wrap;margin-top:12px}
 #message.error{color:#b42318}
 #message.success{color:#087443}
@@ -220,6 +289,8 @@ tbody tr.selected td{background:#dceaff}
   <p id="badge-info" class="muted"></p>
   <label for="name">Nom du participant</label>
   <input id="name" type="text" placeholder="Nom et prénom" maxlength="120" autocomplete="off">
+  <label for="bib">Numéro de dossard (lu par la caméra)</label>
+  <input id="bib" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="Ex. 1042" maxlength="5" autocomplete="off">
   <p><button id="save" type="button" disabled onclick="save()">Enregistrer le participant</button></p>
 </section>
 <section class="panel">
@@ -227,7 +298,7 @@ tbody tr.selected td{background:#dceaff}
   <p class="muted">Sélectionne une seule ligne du tableau, puis utilise le bouton Modifier ou Supprimer ci-dessous.</p>
   <div class="table-wrapper">
     <table aria-label="Participants inscrits">
-      <thead><tr><th class="pick-cell">Choix</th><th>Nom du participant</th><th>EPC du badge</th></tr></thead>
+      <thead><tr><th class="pick-cell">Choix</th><th>Dossard</th><th>Nom du participant</th><th>EPC du badge</th></tr></thead>
       <tbody id="people"></tbody>
     </table>
   </div>
@@ -278,7 +349,7 @@ async function refresh(){
     tableBody.replaceChildren();
     if(!participants.length){
       const tr=document.createElement('tr'),td=document.createElement('td');
-      td.colSpan=3;
+      td.colSpan=4;
       td.textContent='Aucun participant inscrit.';
       tr.append(td);tableBody.append(tr);
     }
@@ -293,9 +364,10 @@ async function refresh(){
       radio.setAttribute('aria-label','Sélectionner '+p.name);
       radio.checked=p.epc===selectedEpc;
       choose.append(radio);
+      const bib=document.createElement('td');bib.className='bib-cell';bib.textContent=p.bib||'—';
       const name=document.createElement('td');name.className='name-cell';name.textContent=p.name;
       const epc=document.createElement('td');epc.className='epc-cell';epc.textContent=p.epc;
-      tr.append(choose,name,epc);tableBody.append(tr);
+      tr.append(choose,bib,name,epc);tableBody.append(tr);
     });
     updateSelection();
   }catch(e){setMessage('Impossible de charger les participants : '+e.message,true)}
@@ -307,12 +379,14 @@ async function renameSelected(){
   if(name===null)return;
   const cleaned=name.trim();
   if(!cleaned||cleaned.length>120){alert('Nom invalide.');return}
+  const bib=prompt('Numéro de dossard (vide = aucun) :',p.bib||'');
+  if(bib===null)return;
   try{
     await api('/api/participants/rename',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({epc:p.epc,name:cleaned})
+      body:JSON.stringify({epc:p.epc,name:cleaned,bib:bib.trim()})
     });
-    setMessage('Nom modifié avec succès.');
+    setMessage('Participant modifié avec succès.');
     await refresh();
   }catch(e){alert(e.message)}
 }
@@ -359,16 +433,18 @@ async function poll(){
 }
 async function save(){
   const name=document.getElementById('name').value.trim();
+  const bib=document.getElementById('bib').value.trim();
   if(!name){setMessage('Saisis un nom.',true);return}
   if(!token){setMessage('Scanne d’abord un badge.',true);return}
   saveBtn.disabled=true;
   try{
     await api('/api/scan/confirm',{
-      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,name})
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,name,bib})
     });
     setMessage('Participant enregistré !');
     document.getElementById('badge-info').textContent='';
     document.getElementById('name').value='';
+    document.getElementById('bib').value='';
     token=null;
     await refresh();
   }catch(e){setMessage(e.message,true);saveBtn.disabled=false}
@@ -412,10 +488,27 @@ def scan_status():
             return jsonify(status='multiple')
         return jsonify(status='ready', epc=next(iter(scan['epcs'])))
 
+def parse_bib(data):
+    """Retourne (dossard ou None, erreur ou None). Un champ vide = pas de dossard."""
+    raw = str(data.get('bib') or '').strip()
+    if not raw:
+        return None, None
+    bib = normalize_bib(raw)
+    if bib is None:
+        return None, 'Numéro de dossard invalide (chiffres uniquement, 5 au maximum).'
+    return bib, None
+
+
+BIB_TAKEN = 'Ce numéro de dossard est déjà utilisé.'
+
+
 @app.post('/api/scan/confirm')
 def scan_confirm():
     data = request.get_json(silent=True) or {}
     name = str(data.get('name', '')).strip()
+    bib, bib_error = parse_bib(data)
+    if bib_error:
+        return jsonify(error=bib_error), 400
     with lock:
         scan = state['scan']
         if state['running']:
@@ -433,8 +526,10 @@ def scan_confirm():
         try:
             if db.execute('SELECT 1 FROM participants WHERE epc=?', (epc,)).fetchone():
                 return jsonify(error='Ce badge est déjà inscrit.'), 409
-            db.execute('INSERT INTO participants(epc,name) VALUES (?,?)', (epc,name))
+            db.execute('INSERT INTO participants(epc,name,bib) VALUES (?,?,?)', (epc, name, bib))
             db.commit()
+        except sqlite3.IntegrityError:
+            return jsonify(error=BIB_TAKEN), 409
         finally:
             db.close()
         state['scan'] = None
@@ -450,20 +545,24 @@ def status():
     with lock:
         db = connect_db()
         try:
-            people = db.execute('SELECT epc,name FROM participants ORDER BY name').fetchall()
-            passages = db.execute('SELECT epc,lap,lap_seconds,elapsed_seconds,timestamp FROM passages ORDER BY id').fetchall()
+            people = db.execute('SELECT epc,name,bib FROM participants ORDER BY name').fetchall()
+            passages = db.execute('SELECT epc,lap,lap_seconds,elapsed_seconds,timestamp,source FROM passages ORDER BY id').fetchall()
         finally:
             db.close()
         rows = []
-        for epc, name in people:
+        for epc, name, bib in people:
             ps = [p for p in passages if p[0] == epc]
-            rows.append({'epc': epc, 'name': name, 'laps': len(ps),
+            rows.append({'epc': epc, 'name': name, 'bib': bib, 'laps': len(ps),
                          'last_lap': ps[-1][2] if ps else None,
                          'best_lap': min((p[2] for p in ps), default=None),
-                         'last_elapsed': ps[-1][3] if ps else None})
+                         'last_elapsed': ps[-1][3] if ps else None,
+                         'last_source': ps[-1][5] if ps else None,
+                         'sources': {s: sum(1 for p in ps if p[5] == s)
+                                     for s in ('rfid', 'camera', 'both')}})
         rows.sort(key=lambda r: (-r['laps'], r['last_elapsed'] if r['last_elapsed'] is not None else float('inf')))
         elapsed = (time.monotonic() - state['started_mono']) if state['running'] else state['stopped_elapsed']
         return jsonify(running=state['running'], elapsed=elapsed, reader=state['reader'],
+                       camera=state['camera'], camera_recent=list(state['camera_recent']),
                        participants=rows, unknown=list(state['unknown'].keys())[-10:])
 
 
@@ -474,13 +573,20 @@ def add_participant():
     name = str(data.get('name', '')).strip()
     if not name or not epc or len(epc) % 2 or any(c not in '0123456789ABCDEF' for c in epc):
         return jsonify(error='Nom ou EPC invalide'), 400
+    bib, bib_error = parse_bib(data)
+    if bib_error:
+        return jsonify(error=bib_error), 400
     with lock:
         if state['running']:
             return jsonify(error='Arrêter la course avant de modifier les participants'), 409
         db = connect_db()
         try:
-            db.execute('INSERT INTO participants(epc,name) VALUES (?,?) ON CONFLICT(epc) DO UPDATE SET name=excluded.name', (epc, name))
+            db.execute('INSERT INTO participants(epc,name,bib) VALUES (?,?,?) '
+                       'ON CONFLICT(epc) DO UPDATE SET name=excluded.name, bib=excluded.bib',
+                       (epc, name, bib))
             db.commit()
+        except sqlite3.IntegrityError:
+            return jsonify(error=BIB_TAKEN), 409
         finally:
             db.close()
     return jsonify(ok=True)
@@ -493,7 +599,9 @@ def start():
             return jsonify(error='Course déjà en cours'), 409
         db = connect_db()
         try:
-            known_epcs = {row[0] for row in db.execute('SELECT epc FROM participants')}
+            people = db.execute('SELECT epc, bib FROM participants').fetchall()
+            known_epcs = {epc for epc, _ in people}
+            bib_to_epc = {bib: epc for epc, bib in people if bib}
             if not known_epcs:
                 return jsonify(error='Ajouter au moins un participant'), 400
             db.execute('DELETE FROM passages')
@@ -504,7 +612,8 @@ def start():
         now = time.monotonic()
         state.update(running=True, started_mono=now, started_wall=datetime.now().isoformat(),
                      stopped_elapsed=0.0, last_seen={}, armed={}, last_lap={},
-                     laps={}, unknown={}, known_epcs=known_epcs)
+                     laps={}, unknown={}, known_epcs=known_epcs,
+                     bib_to_epc=bib_to_epc, last_passage={})
     return jsonify(ok=True)
 
 
@@ -527,6 +636,9 @@ def rename_participant():
 
     if not epc or not name or len(name) > 120:
         return jsonify(error='Nom ou badge invalide.'), 400
+    bib, bib_error = parse_bib(data)
+    if bib_error:
+        return jsonify(error=bib_error), 400
 
     with lock:
         if state['running']:
@@ -534,13 +646,17 @@ def rename_participant():
 
         db = connect_db()
         try:
-            cur = db.execute(
-                'UPDATE participants SET name=? WHERE epc=?',
-                (name, epc)
-            )
+            if 'bib' in data:
+                cur = db.execute('UPDATE participants SET name=?, bib=? WHERE epc=?',
+                                 (name, bib, epc))
+            else:
+                cur = db.execute('UPDATE participants SET name=? WHERE epc=?',
+                                 (name, epc))
             if cur.rowcount == 0:
                 return jsonify(error='Participant introuvable.'), 404
             db.commit()
+        except sqlite3.IntegrityError:
+            return jsonify(error=BIB_TAKEN), 409
         finally:
             db.close()
 
@@ -577,4 +693,5 @@ def delete_participant():
 if __name__ == '__main__':
     connect_db().close()
     threading.Thread(target=reader_worker, daemon=True).start()
+    vision.start(on_bib=process_bib, on_status=set_camera_status)
     app.run(host='127.0.0.1', port=5000, debug=False, threaded=True)
